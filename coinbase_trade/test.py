@@ -1,14 +1,17 @@
 from coinbase.rest import RESTClient
-
-api_key = ""
-api_secret = ""
+from dotenv import load_dotenv
+import os
 
 from json import dumps
 
+load_dotenv()
 
-client = RESTClient(api_key=api_key, api_secret=api_secret)
+client = RESTClient(api_key=os.getenv("API_KEY"), api_secret=os.getenv("API_SECRET"))
 
 ###Get account balances
+#get account id
+# accounts = client.get_accounts()
+# print(accounts)
 
 accounts = client.list_payment_methods()
 print(accounts)
@@ -19,4 +22,3 @@ print(accounts)
 # order = client.market_order_buy(client_order_id="clientOrderId", product_id="BTC-USDC", quote_size="1")
 # book = client.get_products()
 # print(book)
-client.deposit(payment_method_id="faeea233-4182-58f6-b55d-35da447bd79f", amount="1", currency="USD")

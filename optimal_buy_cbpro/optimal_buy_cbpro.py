@@ -9,12 +9,35 @@ import dateutil.parser
 import json
 import requests
 from datetime import datetime, timezone # Added for created_at
+from decimal import Decimal, getcontext, ROUND_DOWN
 
 # Assuming history.py is in the same directory or Python path
 # and defines Order, Deposit, Withdrawal, get_session SQLAlchemy models
 from .history import Order, Deposit, Withdrawal, get_session
 from requests.exceptions import HTTPError
 
+# Use different precision for different coins
+DECIMAL_PRECISION_MAP = {
+    'BTC': Decimal('0.00001'),  # 6 decimal places for BTC
+    'ETH': Decimal('0.00001'),  # 6 decimal places for ETH
+    'JASMY': Decimal('1'),     # 1 decimal place for JASMY
+}
+
+# Price precision can be different from size precision for some coins
+PRICE_PRECISION_MAP = {
+    'BTC': Decimal('0.01'),      # 2 decimal places for BTC price
+    'ETH': Decimal('0.01'),      # 2 decimal places for ETH price
+    'JASMY': Decimal('0.00001'), # 6 decimal places for JASMY price
+}
+
+DEFAULT_PRECISION = Decimal('0.00001')  # Default 4 decimal places
+DEFAULT_PRICE_PRECISION = Decimal('0.01')  # Default 2 decimal places for price
+
+def get_decimal_precision(coin_symbol):
+    return DECIMAL_PRECISION_MAP.get(coin_symbol.upper(), DEFAULT_PRECISION)
+
+def get_price_precision(coin_symbol):
+    return PRICE_PRECISION_MAP.get(coin_symbol.upper(), DEFAULT_PRICE_PRECISION)
 
 def get_weights(coins, fiat_currency):
     market_cap = {}
@@ -23,7 +46,7 @@ def get_weights(coins, fiat_currency):
         response = requests.get("https://api.coingecko.com/api/v3/coins/markets", params={
             'vs_currency': 'usd', # Assuming USD for market cap comparison, adjust if needed
             'order': 'market_cap_desc',
-            'per_page': 100, # Fetching enough coins to likely find those in user's list
+            'per_page': 200, # Fetching enough coins to likely find those in user's list
             'page': 1,
             'sparkline': False
         })
@@ -184,9 +207,23 @@ def get_fiat_balances(args, coins_dict, accounts_response, withdrawn_balances, p
         for acc in accounts_response.accounts:
             currency = acc.currency
             if currency == args.fiat_currency:
-                balances[args.fiat_currency] = float(acc.available_balance.value)
+                # Handle the dictionary structure of available_balance
+                if hasattr(acc, 'available_balance'):
+                    if isinstance(acc.available_balance, dict):
+                        balances[args.fiat_currency] = float(acc.available_balance.get('value', 0))
+                    else:
+                        balances[args.fiat_currency] = float(acc.available_balance)
             elif currency in coins_dict: # Check against configured coins
-                balance = float(acc.available_balance.value) + get_external_balance(coins_dict, currency)
+                # Handle the dictionary structure of available_balance
+                if hasattr(acc, 'available_balance'):
+                    if isinstance(acc.available_balance, dict):
+                        balance = float(acc.available_balance.get('value', 0))
+                    else:
+                        balance = float(acc.available_balance)
+                else:
+                    balance = 0
+                    
+                balance += get_external_balance(coins_dict, currency)
                 if currency in withdrawn_balances: # withdrawn_balances should use uppercase keys if coins_dict does
                     balance += withdrawn_balances[currency]
                 balances[currency] = balance * prices.get(currency, 0) # Use .get for safety if price missing
@@ -210,16 +247,12 @@ def get_account_by_currency(accounts_response, currency_symbol):
 
 def set_buy_order(args, coin_symbol, price, size, client, db_session):
     product_id = f"{coin_symbol}-{args.fiat_currency}"
-    # Ensure price and size are formatted as strings with appropriate precision
-    # The SDK examples suggest string formatting for these.
-    # Max 8 decimal places for size, 2 for price usually, but depends on product.
-    # Consulting product details for increments would be best.
-    # For now, using reasonable formatting.
+    # Use coin-specific precision for size and price
+    size_precision = get_decimal_precision(coin_symbol)
+    price_precision = get_price_precision(coin_symbol)
     
-    formatted_price = f"{price:.2f}" # Example: "123.45"
-    # Determine precision for size from product info if available, else use a default like 8
-    # For now, using a general format.
-    formatted_size = f"{size:.8f}" 
+    formatted_price = str(Decimal(str(price)).quantize(price_precision, rounding=ROUND_DOWN))
+    formatted_size = str(Decimal(str(size)).quantize(size_precision, rounding=ROUND_DOWN))
 
     print(f"Placing limit buy order: coin={coin_symbol}, price={formatted_price}, size={formatted_size}")
     
@@ -238,21 +271,36 @@ def set_buy_order(args, coin_symbol, price, size, client, db_session):
         )
         print(f"Order response: {json.dumps(order_response.to_dict(), indent=2)}")
 
-        if order_response.success and order_response.success_response:
-            order_id = order_response.success_response.order_id
+        # Handle both object and dictionary response structures
+        if isinstance(order_response, dict):
+            success = order_response.get('success', False)
+            success_response = order_response.get('success_response', {})
+            order_id = success_response.get('order_id')
+        else:
+            success = getattr(order_response, 'success', False)
+            success_response = getattr(order_response, 'success_response', None)
+            if success_response:
+                if isinstance(success_response, dict):
+                    order_id = success_response.get('order_id')
+                else:
+                    order_id = getattr(success_response, 'order_id', None)
+            else:
+                order_id = None
+
+        if success and order_id:
             db_session.add(
                 Order(
                     currency=coin_symbol,
                     size=float(size), # Store as float
                     price=float(price), # Store as float
-                    coinbase_order_id=order_id, # Renamed field
+                    cbpro_order_id=order_id, # Fixed field name
                     created_at=datetime.now(timezone.utc), # Using current UTC time
                 )
             )
             db_session.commit()
             return order_response
         else:
-            print(f"Order placement failed or no success response: {order_response.error_response}")
+            print(f"Order placement failed or no success response: {order_response}")
             return order_response # Or handle error appropriately
     except HTTPError as e:
         print(f"HTTPError placing order for {product_id}: {e}")
@@ -263,14 +311,10 @@ def set_buy_order(args, coin_symbol, price, size, client, db_session):
 
 
 def generate_buy_orders(coins_config, coin_symbol, args, amount_to_buy_fiat, current_price):
-    from decimal import Decimal, getcontext, ROUND_DOWN
-
     getcontext().prec = 8 # Precision for crypto size calculations
-    # Price precision depends on the pair, typically 2 for USD pairs.
-    # Let's assume 2 for fiat, but product specific increments are better.
     
     buy_orders = []
-
+    
     minimum_order_value_fiat = coins_config[coin_symbol].get("minimum_order_size", 0.01) # This is quote_min_size
 
     # Ensure amount_to_buy_fiat meets the minimum order value
@@ -291,35 +335,41 @@ def generate_buy_orders(coins_config, coin_symbol, args, amount_to_buy_fiat, cur
     if number_of_orders == 0 : # Should be caught by amount_to_buy_fiat check already
         return buy_orders
 
-
     # Amount of fiat per order
     amount_fiat_per_order = Decimal(str(amount_to_buy_fiat)) / Decimal(str(number_of_orders))
-    # Floor to 2 decimal places for fiat
-    amount_fiat_per_order = amount_fiat_per_order.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-
+    print(f"precision: {get_decimal_precision(coin_symbol)}")
+    amount_fiat_per_order = amount_fiat_per_order.quantize(get_decimal_precision(coin_symbol), rounding=ROUND_DOWN)
+    print(f"Initial amount fiat per order: {amount_fiat_per_order}")
 
     if amount_fiat_per_order < Decimal(str(minimum_order_value_fiat)):
         # This can happen if amount_to_buy_fiat is small, and order_count is high
         # Recalculate number_of_orders based on minimum value per order
         number_of_orders = max(1, math.floor(Decimal(str(amount_to_buy_fiat)) / Decimal(str(minimum_order_value_fiat))))
+        print(f"Recalculated number of orders: {number_of_orders}")
         amount_fiat_per_order = Decimal(str(amount_to_buy_fiat)) / Decimal(str(number_of_orders))
-        amount_fiat_per_order = amount_fiat_per_order.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        amount_fiat_per_order = amount_fiat_per_order.quantize(get_decimal_precision(coin_symbol), rounding=ROUND_DOWN)
+        print(f"Adjusted amount fiat per order: {amount_fiat_per_order}")
 
     discount_factor = Decimal(str(1 - args.starting_discount))
     price_decimal = Decimal(str(current_price))
+    print(f"Starting discount factor: {discount_factor}, price: {price_decimal}")
 
     for i in range(number_of_orders):
-        # Ensure discounted price has appropriate precision (e.g., 2 decimal places for USD pairs)
-        discounted_price = (price_decimal * discount_factor).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        # Ensure discounted price has appropriate precision
+        
+        discounted_price = (price_decimal * discount_factor).quantize(get_price_precision(coin_symbol), rounding=ROUND_DOWN)
+        print(f"Calculated discounted price: {discounted_price} for {coin_symbol} (original: {price_decimal}, discount: {discount_factor}, precision: {get_price_precision(coin_symbol)})")
+        print(f"Discounted price for {coin_symbol}: {discounted_price}")
         if discounted_price <= Decimal("0"): # Price cannot be zero or negative
             print(f"Warning: Discounted price for {coin_symbol} is too low ({discounted_price}). Skipping this order split.")
             continue
             
-        # Calculate size in base currency
+        # Calculate size in base currency - as price increases, size should decrease
+        # to maintain the same fiat value per order
+        print(f"Amount fiat per order for {coin_symbol}: {amount_fiat_per_order}")
+        print(f"Discounted price for {coin_symbol}: {discounted_price}")
         size_base_currency = amount_fiat_per_order / discounted_price
-        # Apply size precision (e.g., 8 decimal places for BTC) - product specific increments are better
-        size_base_currency = size_base_currency.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
-
+        size_base_currency = size_base_currency.quantize(get_decimal_precision(coin_symbol), rounding=ROUND_DOWN)
 
         if size_base_currency * discounted_price < Decimal(str(minimum_order_value_fiat)):
              print(f"Skipping order for {coin_symbol} at price {discounted_price} due to size {size_base_currency} valuing less than minimum.")
@@ -340,7 +390,7 @@ def place_buy_orders(args, amount_to_buy_fiat, coins_config, coin_symbol, curren
     if current_price <= 0:
         print(f"Current price={current_price} for {coin_symbol}, not buying.")
         return
-
+    print(f"Placing buy orders for {coin_symbol} with amount {amount_to_buy_fiat} at price {current_price}")
     buy_orders_params = generate_buy_orders(coins_config, coin_symbol, args, amount_to_buy_fiat, current_price)
     for order_params in buy_orders_params:
         set_buy_order(
@@ -407,17 +457,12 @@ def start_buy_orders(
 
 def execute_withdrawal(client, amount_str, currency_symbol, crypto_address, db_session):
     # Ensure amount is a string with correct precision for the API
-    # The original script did: amount = "{0:.9f}".format(float(amount_str))[0:-1] (effective 8 places, floored)
-    # It's safer to format based on known crypto precision or product info.
-    # For now, let's assume 8 decimal places as a common standard for many cryptos.
     try:
         amount_decimal = Decimal(str(amount_str))
-        # Example: floor to 8 decimal places
-        formatted_amount = str(amount_decimal.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN))
+        formatted_amount = str(amount_decimal.quantize(get_decimal_precision(currency_symbol), rounding=ROUND_DOWN))
     except:
         print(f"Could not format amount {amount_str} for withdrawal. Using as is.")
         formatted_amount = str(amount_str)
-
 
     print(f"Attempting to withdraw {formatted_amount} {currency_symbol} to {crypto_address}")
 

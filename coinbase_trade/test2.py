@@ -1,6 +1,11 @@
 import requests
 from coinbase.rest import RESTClient
 from requests.exceptions import HTTPError
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
 def get_weights(coins, fiat_currency):
     market_cap = {}
     try:
@@ -81,8 +86,8 @@ def get_prices(client, coins_symbols_list, fiat_currency):
             raise # Or prices[c_symbol] = None and handle later
     return prices
 
-api_key = ""
-api_secret = ""
+api_key = os.getenv("API_KEY")
+api_secret = os.getenv("API_SECRET")
 
 client = RESTClient(api_key=api_key, api_secret=api_secret)
 coins = {
